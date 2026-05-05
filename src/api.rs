@@ -15,9 +15,7 @@
 //!   - [`Error`]              — public error enum
 //!
 //! Stable entry points:
-//!   - [`from_bytes`]         — standalone (no simd-json dep)
-//!   - [`from_simdjson`]      — fused build from a parsed simd-json tape
-//!   - [`parse`]              — convenience: parse + build in one call
+//!   - [`from_bytes`]         — build a structural index from JSON bytes
 //!
 //! Stable fused query helpers:
 //!   - [`find_eq`]            — `$..find(key == literal)`
@@ -31,8 +29,6 @@
 
 use std::sync::Arc;
 
-#[cfg(feature = "simd-json")]
-use crate::from_tape::{build_from_tape_and_structurals, parse_with_index};
 use crate::index::StructIndex;
 use crate::keys::{value_for_key as keys_value_for_key, KeyBitmaps, Role};
 use crate::stage1::Kind;
@@ -591,42 +587,6 @@ pub fn from_bytes_with(bytes: &[u8], opts: BuildOptions) -> Result<StructuralInd
     })
 }
 
-#[cfg(feature = "simd-json")]
-pub fn from_simdjson<'input>(
-    tape: &simd_json::tape::Tape<'input>,
-    bytes: &[u8],
-    structurals: &[u32],
-    opts: BuildOptions,
-) -> Result<StructuralIndex, Error> {
-    let (idx, keys) = build_from_tape_and_structurals(tape, bytes, structurals)
-        .map_err(|s| Error::Parse(s))?;
-    let keys = if opts.keys { Some(keys) } else { None };
-    Ok(StructuralIndex {
-        inner: Arc::new(Inner { idx, keys }),
-    })
-}
-
-#[cfg(feature = "simd-json")]
-pub struct Parsed {
-    pub bytes: Vec<u8>,
-    pub index: StructuralIndex,
-}
-
-#[cfg(feature = "simd-json")]
-pub fn parse(bytes: Vec<u8>) -> Result<Parsed, Error> {
-    let p = parse_with_index(bytes).map_err(|s| Error::Parse(s))?;
-    Ok(Parsed {
-        bytes: p.bytes,
-        index: StructuralIndex {
-            inner: Arc::new(Inner {
-                idx: p.index,
-                keys: Some(p.keys),
-            }),
-        },
-    })
-}
-
-
 /// `$..find(key == literal)` — emit enclosing-Object token ids.
 ///
 /// `literal` is the **plain** value bytes to match (e.g. `b"PushEvent"`).
@@ -861,21 +821,6 @@ pub fn validate_utf8(bytes: &[u8]) -> Result<(), Error> {
 }
 
 
-#[cfg(feature = "simd-json")]
-pub mod sj {
-    use super::*;
-
-    pub fn node<'a, 'input>(
-        idx: &StructuralIndex,
-        tape: &'a simd_json::tape::Tape<'input>,
-        tok: TokenId,
-    ) -> Option<&'a simd_json::Node<'input>> {
-        let t = idx.tape_index(tok)? as usize;
-        tape.0.get(t)
-    }
-}
-
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1040,20 +985,4 @@ mod tests {
         assert!(validate_utf8(b"\xff\xfe").is_err()); // invalid UTF-8
     }
 
-    #[cfg(feature = "simd-json")]
-    #[test]
-    fn parse_via_simdjson_path() {
-        let buf = br#"{"a":[1,2,3],"b":"hi"}"#.to_vec();
-        let parsed = parse(buf).unwrap();
-        assert!(parsed.index.has_keys());
-        assert!(parsed.index.has_key("a"));
-        assert!(parsed.index.has_key("b"));
-        // tape_index should be Some for value-bearing tokens.
-        let some_token = parsed
-            .index
-            .tokens()
-            .find(|t| parsed.index.kind(*t) == TokenKind::Object);
-        assert!(some_token.is_some());
-        assert!(parsed.index.tape_index(some_token.unwrap()).is_some());
-    }
 }

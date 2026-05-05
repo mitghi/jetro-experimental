@@ -28,14 +28,6 @@ pub use api::{multi_key_finder, multi_key_scan};
 #[cfg(feature = "validate-utf8")]
 pub use api::validate_utf8;
 
-#[cfg(feature = "simd-json")]
-pub use api::{parse, from_simdjson, sj, Parsed};
-
-#[cfg(feature = "simd-json")]
-pub mod streaming;
-#[cfg(feature = "simd-json")]
-pub use streaming::{LineBuilder, LineIter, LineParsed};
-
 // === Internals (kept public for tests/benches; do not depend on these
 // from library code — they may change without semver bumps).
 #[doc(hidden)]
@@ -44,10 +36,6 @@ pub mod index;
 pub mod keys;
 #[doc(hidden)]
 pub mod stage1;
-
-#[doc(hidden)]
-#[cfg(feature = "simd-json")]
-pub mod from_tape;
 
 #[doc(hidden)]
 pub use index::{parent_chain, token_at, StructIndex};

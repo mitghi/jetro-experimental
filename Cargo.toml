@@ -7,32 +7,19 @@ authors = ["Milad (Mike) Taghavi <mitghi.at.me.com>"]
 [dependencies]
 croaring = "2"
 memchr = "2"
-# Vendored fork at vendor-simd-json/ — adds Buffers::structural_indexes()
-# accessor on top of upstream simd-json 0.13.10.  Path dep keeps the crate
-# name `simd-json` so downstream code reads identically.
-simd-json = { path = "vendor-simd-json", optional = true }
 fast-float = { version = "0.2", optional = true }
 aho-corasick = { version = "1", optional = true }
 simdutf8 = { version = "0.1", optional = true }
-rayon = { version = "1", optional = true }
-memmap2 = { version = "0.9", optional = true }
 
 [features]
 default = []
-simd-json = ["dep:simd-json"]
 fast-numbers = ["dep:fast-float"]
 multi-key = ["dep:aho-corasick"]
 validate-utf8 = ["dep:simdutf8"]
-ndjson-cli = ["dep:rayon", "dep:memmap2", "simd-json"]
 
 [dev-dependencies]
 criterion = { version = "0.5", default-features = false, features = ["html_reports"] }
 serde_json = "1"
-
-[[bench]]
-name = "substrate"
-harness = false
-required-features = ["simd-json", "fast-numbers"]
 
 [lib]
 path = "src/lib.rs"
@@ -40,16 +27,6 @@ path = "src/lib.rs"
 [[bin]]
 name = "demo"
 path = "src/bin/demo.rs"
-
-[[bin]]
-name = "jetro_bridge_demo"
-path = "src/bin/jetro_bridge_demo.rs"
-required-features = ["simd-json"]
-
-[[bin]]
-name = "ndjson_select"
-path = "src/bin/ndjson_select.rs"
-required-features = ["simd-json", "ndjson-cli"]
 
 [profile.release]
 opt-level = 3
