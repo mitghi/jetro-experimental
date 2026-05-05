@@ -3,6 +3,8 @@ name = "jetro-experimental"
 version = "0.1.0"
 edition = "2021"
 authors = ["Milad (Mike) Taghavi <mitghi.at.me.com>"]
+license = "MIT"
+description = "SIMD accelerated structural indexing and Mison algorithm for jetro"
 
 [dependencies]
 croaring = "2"
