@@ -9,11 +9,11 @@ without materialising the value tree.
 
 Given a JSON byte buffer, build:
 
-1. **Stage-1 columns** — byte offset, kind, depth for every structural
+1. **Stage-1 columns** from [simd-json](https://github.com/simd-lite/simd-json) byte offset, kind, depth for every structural
    character (`{`, `}`, `[`, `]`, `"`, `:`, `,`, scalar starts).  AVX2
    fast path; scalar/`memchr` fallback elsewhere.
 2. **Sidecar** — `parent[]`, `close_of[]` for tree navigation.
-3. **Mison key bitmaps** — interned key dictionary with a Roaring bitmap
+3. **Mison key bitmaps**  interned key dictionary with a Roaring bitmap
    per key over token positions.  Compound predicates via bitmap-AND.
 
 Built once, reusable.  Queries like `$..find(x == "test")` use the
@@ -158,7 +158,7 @@ fn parse_i64(bytes: &[u8]) -> Option<i64>;
 | `multi-key`       | Aho-Corasick + Teddy multi-pattern matcher for raw byte scans   |
 | `validate-utf8`   | `simdutf8` (~5-10 GB/s)                                         |
 
-Default: minimal.  No external SIMD-JSON dependency — stage-1 is fully
+Default: minimal.  No external SIMD-JSON dependency — stage-1 of [simd-json](https://github.com/simd-lite/simd-json) is fully
 self-contained.
 
 ## Status
@@ -177,5 +177,7 @@ helpers).  Internals (`Stage1`, `KeyBitmaps`, `StructIndex`) are
 - [ ] Streaming `IndexBuilder` for NDJSON / huge inputs
 
 ## License
+
+This repository contain direct copy of Stage 1 from [simd-json](https://github.com/simd-lite/simd-json) project.
 
 MIT/Apache-2.0.
