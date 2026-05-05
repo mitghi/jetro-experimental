@@ -391,8 +391,12 @@ impl StructuralIndex {
     }
 
     /// Subtree-restricted key search: matches only tokens whose token-index
-    /// falls within `[root.raw(), close_of(root)]`.  Implemented as a
-    /// Roaring bitmap range AND over the underlying key bitmap (SIMD).
+    /// falls within `[root.raw(), close_of(root)]`.
+    ///
+    /// Iterates the precomputed key bitmap via a borrowed roaring cursor —
+    /// no bitmap allocation, no range AND. The returned `KeyHits` walks the
+    /// underlying bitmap with `reset_at_or_after(lo)` and stops once the
+    /// cursor's value exceeds `close_of(root)`.
     pub fn keys_named_in<'a>(&'a self, name: &str, root: TokenId) -> KeyHits<'a> {
         let kb = match &self.inner.keys {
             Some(k) => k,
@@ -406,22 +410,41 @@ impl StructuralIndex {
             .close_of(root)
             .map(|t| t.0)
             .unwrap_or(self.token_count().saturating_sub(1));
-        let mut range = croaring::Bitmap::new();
-        range.add_range(root.0..=close);
         let bm = &kb.bitmaps[id as usize];
-        let mut out = bm.clone();
-        out.and_inplace(&range);
-        KeyHits::from_bitmap(out)
+        KeyHits::bounded(bm, root.0, close)
     }
 
     /// Direct field lookup on a single container token: returns the value
-    /// token of the named key, if present.  O(N) over the container's
-    /// immediate keys.
+    /// token of the named key, if present.
+    ///
+    /// Walks the global key bitmap for `name` via a borrowed roaring cursor
+    /// seeked to `parent.0 + 1` and stopping at `close_of(parent)`. Matches
+    /// the first key token whose `parent[]` entry equals `parent`. No bitmap
+    /// allocation, no range AND, no `KeyHits` materialisation — pure cursor
+    /// seek over the precomputed key bitmap.
     pub fn field_of(&self, parent: TokenId, name: &str) -> Option<TokenId> {
-        for k_tok in self.keys_named_in(name, parent) {
+        let kb = self.inner.keys.as_ref()?;
+        let id = *kb.by_name.get(name)?;
+        let bm = &kb.bitmaps[id as usize];
+        let close = self
+            .close_of(parent)
+            .map(|t| t.0)
+            .unwrap_or_else(|| self.token_count().saturating_sub(1));
+        let lo = parent.0.saturating_add(1);
+        if lo > close {
+            return None;
+        }
+        let mut cur = bm.cursor();
+        cur.reset_at_or_after(lo);
+        while let Some(v) = cur.current() {
+            if v > close {
+                break;
+            }
+            let k_tok = TokenId(v);
             if self.parent(k_tok) == Some(parent) {
                 return self.value_for_key(k_tok);
             }
+            cur.move_next();
         }
         None
     }
@@ -482,29 +505,77 @@ impl<'a> Iterator for Ancestors<'a> {
 /// Iteration uses a materialised `Vec<u32>` (cached on first call) so the
 /// underlying bitmap is preserved for subsequent ops like `count()` /
 /// `first()` / `last()`.
+/// Iterator over key tokens. Has two modes:
+/// - **Owned**: holds a `croaring::Bitmap` (used by `keys_named` and after
+///   `and`/`or` set ops). Iteration materialises a `Vec<u32>` once.
+/// - **Bounded**: borrows the source key bitmap and walks it via a
+///   roaring cursor restricted to `[lo, hi]`. No allocation, no AND.
+///   Used by `keys_named_in` for subtree-restricted scans (the hot path).
 pub struct KeyHits<'a> {
-    bitmap: Option<croaring::Bitmap>,
-    cache: Option<Vec<u32>>,
-    pos: usize,
-    _ph: std::marker::PhantomData<&'a ()>,
+    state: KeyHitsState<'a>,
+}
+
+enum KeyHitsState<'a> {
+    Empty,
+    Owned {
+        bitmap: croaring::Bitmap,
+        cache: Option<Vec<u32>>,
+        pos: usize,
+    },
+    Bounded {
+        bitmap: &'a croaring::Bitmap,
+        cursor: Option<croaring::bitmap::BitmapCursor<'a>>,
+        lo: u32,
+        hi: u32,
+        started: bool,
+    },
 }
 
 impl<'a> KeyHits<'a> {
     fn from_bitmap(bm: croaring::Bitmap) -> Self {
         Self {
-            bitmap: Some(bm),
-            cache: None,
-            pos: 0,
-            _ph: std::marker::PhantomData,
+            state: KeyHitsState::Owned {
+                bitmap: bm,
+                cache: None,
+                pos: 0,
+            },
+        }
+    }
+
+    pub(crate) fn bounded(bitmap: &'a croaring::Bitmap, lo: u32, hi: u32) -> Self {
+        if lo > hi {
+            return Self::empty();
+        }
+        Self {
+            state: KeyHitsState::Bounded {
+                bitmap,
+                cursor: None,
+                lo,
+                hi,
+                started: false,
+            },
         }
     }
 
     fn empty() -> Self {
         Self {
-            bitmap: None,
-            cache: None,
-            pos: 0,
-            _ph: std::marker::PhantomData,
+            state: KeyHitsState::Empty,
+        }
+    }
+
+    /// Convert any state into an owned bitmap (allocates only when bounded);
+    /// used by set-ops (`and`/`or`) which require materialised bitmaps.
+    fn into_owned_bitmap(self) -> Option<croaring::Bitmap> {
+        match self.state {
+            KeyHitsState::Empty => None,
+            KeyHitsState::Owned { bitmap, .. } => Some(bitmap),
+            KeyHitsState::Bounded { bitmap, lo, hi, .. } => {
+                let mut range = croaring::Bitmap::new();
+                range.add_range(lo..=hi);
+                let mut out = bitmap.clone();
+                out.and_inplace(&range);
+                Some(out)
+            }
         }
     }
 
@@ -512,8 +583,8 @@ impl<'a> KeyHits<'a> {
         self
     }
 
-    pub fn and(mut self, mut other: KeyHits<'a>) -> Self {
-        match (self.bitmap.take(), other.bitmap.take()) {
+    pub fn and(self, other: KeyHits<'a>) -> Self {
+        match (self.into_owned_bitmap(), other.into_owned_bitmap()) {
             (Some(mut a), Some(b)) => {
                 a.and_inplace(&b);
                 Self::from_bitmap(a)
@@ -522,51 +593,120 @@ impl<'a> KeyHits<'a> {
         }
     }
 
-    pub fn or(mut self, mut other: KeyHits<'a>) -> Self {
-        match (self.bitmap.take(), other.bitmap.take()) {
+    pub fn or(self, other: KeyHits<'a>) -> Self {
+        match (self.into_owned_bitmap(), other.into_owned_bitmap()) {
             (Some(mut a), Some(b)) => {
                 a.or_inplace(&b);
                 Self::from_bitmap(a)
             }
-            (Some(a), None) => Self::from_bitmap(a),
-            (None, Some(b)) => Self::from_bitmap(b),
+            (Some(a), None) | (None, Some(a)) => Self::from_bitmap(a),
             _ => Self::empty(),
         }
     }
 
     pub fn count(self) -> u64 {
-        self.bitmap.as_ref().map(|b| b.cardinality()).unwrap_or(0)
+        match self.state {
+            KeyHitsState::Empty => 0,
+            KeyHitsState::Owned { bitmap, .. } => bitmap.cardinality(),
+            KeyHitsState::Bounded { bitmap, lo, hi, .. } => {
+                bitmap.range_cardinality(lo..=hi)
+            }
+        }
     }
 
     pub fn first(self) -> Option<TokenId> {
-        self.bitmap.as_ref().and_then(|b| b.minimum()).map(TokenId)
+        match self.state {
+            KeyHitsState::Empty => None,
+            KeyHitsState::Owned { bitmap, .. } => bitmap.minimum().map(TokenId),
+            KeyHitsState::Bounded { bitmap, lo, hi, .. } => {
+                let mut cur = bitmap.cursor();
+                cur.reset_at_or_after(lo);
+                cur.current().filter(|&v| v <= hi).map(TokenId)
+            }
+        }
     }
 
     pub fn last(self) -> Option<TokenId> {
-        self.bitmap.as_ref().and_then(|b| b.maximum()).map(TokenId)
-    }
-
-    pub fn collect_into(mut self, buf: &mut Vec<TokenId>) {
-        if let Some(bm) = self.bitmap.take() {
-            buf.extend(bm.to_vec().into_iter().map(TokenId));
+        match self.state {
+            KeyHitsState::Empty => None,
+            KeyHitsState::Owned { bitmap, .. } => bitmap.maximum().map(TokenId),
+            KeyHitsState::Bounded { bitmap, lo, hi, .. } => {
+                // Walk forward from lo, tracking the last value <= hi.
+                // Roaring cursors don't expose a backwards-from variant in this
+                // crate version; the bounded last is rare so the linear scan is
+                // acceptable.
+                let mut cur = bitmap.cursor();
+                cur.reset_at_or_after(lo);
+                let mut last = None;
+                while let Some(v) = cur.current() {
+                    if v > hi {
+                        break;
+                    }
+                    last = Some(TokenId(v));
+                    cur.move_next();
+                }
+                last
+            }
         }
     }
 
-    fn ensure_cache(&mut self) {
-        if self.cache.is_some() {
-            return;
+    pub fn collect_into(self, buf: &mut Vec<TokenId>) {
+        match self.state {
+            KeyHitsState::Empty => {}
+            KeyHitsState::Owned { bitmap, .. } => {
+                buf.extend(bitmap.to_vec().into_iter().map(TokenId));
+            }
+            KeyHitsState::Bounded { bitmap, lo, hi, .. } => {
+                let mut cur = bitmap.cursor();
+                cur.reset_at_or_after(lo);
+                while let Some(v) = cur.current() {
+                    if v > hi {
+                        break;
+                    }
+                    buf.push(TokenId(v));
+                    cur.move_next();
+                }
+            }
         }
-        self.cache = self.bitmap.as_ref().map(|b| b.to_vec()).or(Some(Vec::new()));
     }
 }
 
 impl<'a> Iterator for KeyHits<'a> {
     type Item = TokenId;
     fn next(&mut self) -> Option<TokenId> {
-        self.ensure_cache();
-        let v = self.cache.as_ref()?.get(self.pos).copied()?;
-        self.pos += 1;
-        Some(TokenId(v))
+        match &mut self.state {
+            KeyHitsState::Empty => None,
+            KeyHitsState::Owned { bitmap, cache, pos } => {
+                if cache.is_none() {
+                    *cache = Some(bitmap.to_vec());
+                }
+                let v = cache.as_ref()?.get(*pos).copied()?;
+                *pos += 1;
+                Some(TokenId(v))
+            }
+            KeyHitsState::Bounded {
+                bitmap,
+                cursor,
+                lo,
+                hi,
+                started,
+            } => {
+                if !*started {
+                    let mut c = bitmap.cursor();
+                    c.reset_at_or_after(*lo);
+                    *cursor = Some(c);
+                    *started = true;
+                } else if let Some(c) = cursor.as_mut() {
+                    c.move_next();
+                }
+                let c = cursor.as_ref()?;
+                let v = c.current()?;
+                if v > *hi {
+                    return None;
+                }
+                Some(TokenId(v))
+            }
+        }
     }
 }
 
